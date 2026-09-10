@@ -407,7 +407,7 @@ contains
    if (isOptionDefined('Emulation Scheme')) then
       rstatus = getCmdLineOptionValue('Emulation Scheme',sname)
       if (emul_enabled) then
-         if (nocaseCompare(sname,SchemeName(SchemeIndex)) /= 0) then
+         if (.not.nocaseCompare(sname,SchemeName(SchemeIndex))) then
             call ErrorHandler('read_cmdline_emul_param','Inconsistent schemes are given', &
                               sname,SchemeName(SchemeIndex))
          endif
@@ -418,7 +418,7 @@ contains
 !        =============================================================
          SchemeIndex = 0
          do i = 1, NumSchemes
-            if (nocaseCompare(sname,SchemeName(i)) == 0) then
+            if (nocaseCompare(sname,SchemeName(i))) then
                SchemeIndex = i
                exit
             endif

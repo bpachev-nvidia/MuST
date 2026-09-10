@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
+#include <nvtx3/nvToolsExt.h>
 #include <complex.h>
 #include "cuComplex.h"
 #include "acclib.hpp"
@@ -872,6 +873,8 @@ void commit_to_gpu_(int *mat_id) {
 extern "C"
 void construct_bigmatrix_gpu_(double _Complex *kappa, int *numnb_max, 
                               int *ia, int *num_nbs, int *lmax_kkr) {
+    nvtxRangePushA("Matrix construction");
+
     const cuDoubleComplex one = make_cuDoubleComplex(1.0, 0.0);
     const cuDoubleComplex zero = make_cuDoubleComplex(0.0, 0.0);
     double _Complex neg_kappa_inv = -1.0/(*kappa);
@@ -959,6 +962,7 @@ void construct_bigmatrix_gpu_(double _Complex *kappa, int *numnb_max,
     // Cleanup
     checkCublasErrors(cublasDestroy(handle));
     // checkCudaErrors(cudaStreamDestroy(stream));
+    nvtxRangePop();
 }
 
 extern "C"
@@ -994,8 +998,13 @@ void invert_bigmatrix_gpu_(double _Complex *block, int *block_size) {
 
    // Perform matrix inverse on the device
    // ============================================
+   nvtxRangePushA("LU factorization");
    checkCusolverErrors(cusolverDnZgetrf(cusolverHandle, mmat_size, mmat_size, BigMat_d, mmat_size, 
                                         workArray, pivotArray, infoArray));
+   checkCudaErrors(cudaStreamSynchronize(stream));
+   nvtxRangePop();
+
+   nvtxRangePushA("Post-processing after LU factorization");
    checkCusolverErrors(cusolverDnZgetrs(cusolverHandle, CUBLAS_OP_N, mmat_size, mmat_size, BigMat_d, 
                                         mmat_size, pivotArray, BigMatInv_d, mmat_size, infoArray)); 
 
@@ -1025,6 +1034,7 @@ void invert_bigmatrix_gpu_(double _Complex *block, int *block_size) {
    // clean up
    // ============================================
    checkCudaErrors(cudaStreamSynchronize(stream));
+   nvtxRangePop();
 
    // cpu_time = ((double)(clock()-t0))/CLOCKS_PER_SEC;
    // if (my_rank == -1) {

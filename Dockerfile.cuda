@@ -1,0 +1,78 @@
+FROM ubuntu:24.04
+
+
+
+RUN apt update && apt install -y \
+    build-essential \
+    git \
+    wget \
+    ca-certificates \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    flex \
+    bison \
+    cmake \
+    ninja-build \
+    rdma-core \
+    libibverbs1 \
+    libibverbs-dev \
+    ibverbs-providers \
+    librdmacm1 \
+    librdmacm-dev \
+    numactl \
+    libnuma-dev \
+    curl \
+    gfortran \
+    tzdata \
+    libtirpc-dev \
+    libmetis-dev \
+    libscalapack-openmpi-dev \
+    liblapack-dev \
+    libblas-dev
+
+
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+RUN dpkg -i cuda-keyring_1.1-1_all.deb
+RUN apt update && apt-get -y install cuda-toolkit-13-4
+RUN rm -r cuda-keyring_1.1-1_all.deb /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda
+
+RUN git clone --branch v1.22.0 --depth 1 https://github.com/openucx/ucx.git /tmp/ucx && \
+    cd /tmp/ucx && \
+    ./autogen.sh && \
+    ./configure \
+      --with-cuda=${CUDA_HOME} \
+      --with-rdmacm \
+      --with-verbs \
+      --with-mlx5 \
+      --enable-cma \
+      --enable-mt \
+      --disable-logging \
+      --disable-debug \
+      --disable-assertions \
+      --disable-params-check \
+      --without-java \
+      --without-go \
+      --without-xpmem && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/ucx
+
+
+RUN wget -q https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-5.0.10.tar.gz -O /tmp/openmpi.tar.gz && \
+    mkdir -p /tmp/openmpi && \
+    tar -xf /tmp/openmpi.tar.gz -C /tmp/openmpi --strip-components=1 && \
+    cd /tmp/openmpi && \
+    ./configure \
+      --with-cuda=${CUDA_HOME} \
+      --with-ucx \
+      --with-verbs && \
+    make -j"$(nproc)" && \
+    make install && \
+    rm -rf /tmp/openmpi /tmp/openmpi.tar.gz
+
+ENV PATH="${PATH}:/usr/local/cuda/bin"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/cuda/lib64"
+ENV LIBRARY_PATH="${LIBRARY_PATH}:/usr/local/cuda/lib64"
