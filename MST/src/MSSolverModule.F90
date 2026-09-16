@@ -79,6 +79,10 @@
 !  *    Output:  N/A                                                 *
 !  *******************************************************************
 module MSSolverModule
+#if defined(CUDA) || defined(ACCELERATOR_CUDA_C)
+   use, intrinsic :: iso_c_binding, only : c_int, c_double_complex, c_ptr, c_loc, c_null_ptr
+#endif
+   use NvtxModule, only : nvtxStartRange, nvtxEndRange
    use KindParamModule, only : IntKind, RealKind, CmplxKind, LongIntKind
    use MathParamModule, only : ZERO, CZERO, CONE, TEN2m6, TEN2m7, TEN2m8, HALF, SQRTm1
    use ErrorHandlerModule, only : ErrorHandler, WarningHandler, StopHandler
@@ -180,6 +184,20 @@ private
 !
    logical :: isDosSymmOn = .false.
    logical :: rad_deriv = .false.
+#if defined(CUDA) || defined(ACCELERATOR_CUDA_C)
+   interface
+      function mst_reconstruct_green_gpu(nr, nout, kp, kk, kg, spins, derivatives, &
+                                        phi, dphi, kau, gaunt_in, conjugate_index, phase, &
+                                        green, dgreen) bind(C, name='mst_reconstruct_green_gpu') result(done)
+         import :: c_int, c_ptr
+         integer(c_int), value :: nr, nout, kp, kk, kg, spins, derivatives
+         type(c_ptr), intent(in) :: phi(*), dphi(*)
+         type(c_ptr), value :: kau, gaunt_in, green, dgreen
+         integer(c_int), intent(in) :: conjugate_index(*), phase(*)
+         integer(c_int) :: done
+      end function mst_reconstruct_green_gpu
+   end interface
+#endif
 !   
 contains
 !
@@ -842,6 +860,7 @@ contains
 !
    logical, optional, intent(in) :: add_Ts, add_Gs, isSphSolver
    logical :: add_SingleSiteT, add_SingleSiteG
+   logical :: gpu_reconstructed
 !
    integer (kind=IntKind), intent(in) :: is
 !
@@ -903,6 +922,7 @@ contains
       endif
    endif
 !
+   call nvtxStartRange('Single-site scattering')
    if (add_SingleSiteG) then
       do id = 1, LocalNumAtoms
          do js1 = 1, n_spin_cant
@@ -934,6 +954,8 @@ contains
       enddo
    endif
 !
+   call nvtxEndRange()
+   call nvtxStartRange('Multiple-scattering matrix solve')
    if (getCmdLineOption('Print the Tau Matrix') == 0) then
 !     ----------------------------------------------------------------
       call computeMSTMatrix(is,e,tau_needed=.true.)
@@ -963,6 +985,8 @@ contains
    endif
 #endif
 !
+   call nvtxEndRange()
+   call nvtxStartRange('CPU Green-function reconstruction')
    Energy = e
    kappa = sqrt(e)
 !
@@ -1016,6 +1040,14 @@ contains
 !        -------------------------------------------------------------
 !        call ErrorHandler('computeMSGreenFunction', 'Debug Stop')
 !        -------------------------------------------------------------
+         gpu_reconstructed = .false.
+#if defined(CUDA) || defined(ACCELERATOR_CUDA_C)
+!        Keep distributed angular sums and the optional single-site T correction
+!        on the original CPU path. The helper also checks layouts and GPU availability.
+         if (isLSMS() .and. method == 0 .and. NumPEsInGroup == 1 .and. .not.add_SingleSiteT) then
+            gpu_reconstructed = reconstructGreenGPU(id,ia,kau00)
+         endif
+#endif
          ns = 0
          do js2 = 1, n_spin_cant
 !           ==========================================================
@@ -1038,10 +1070,10 @@ contains
                endif
                ns = ns + 1
                gf => mst(id)%green(:,:,ns,ia)
-               gf = CZERO
+               if (.not.gpu_reconstructed) gf = CZERO
                if (rad_deriv) then
                   dgf => mst(id)%der_green(:,:,ns,ia)
-                  dgf = CZERO
+                  if (.not.gpu_reconstructed) dgf = CZERO
                endif
                p_kau00 => kau00(:,:,ns)
 !              =======================================================
@@ -1062,7 +1094,10 @@ contains
                   p_kau00 => pau00
                endif
 !              =======================================================
-               if (method == 0) then
+               if (gpu_reconstructed) then
+!                 All spin blocks and radial derivatives are already on the host.
+!                 Single-site additions and symmetry below remain common to both paths.
+               else if (method == 0) then
 !                 ====================================================
 !                 ppr(ir,klp1,kl2) = sum_kl1 PhiLr_left(ir,klp1,kl1) * 
 !                                            p_kau00(kl1,kl2)
@@ -1289,9 +1324,65 @@ contains
 !
    nullify(kau00, p_kau00, pau00, OmegaHat, gf, dgf, pp, ppr, ppg, tfac)
    nullify(PhiLr_right, PhiLr_left, der_PhiLr_right, der_PhiLr_left)
+   call nvtxEndRange()
 !
    end subroutine computeMSGreenFunction
 !  ===================================================================
+#if defined(CUDA) || defined(ACCELERATOR_CUDA_C)
+!
+   logical function reconstructGreenGPU(id,ia,kau) result(done)
+!  Batch the contractions for all spin pairs of one atom/species. C pointers
+!  refer to solver-owned contiguous arrays, avoiding large Fortran temporaries.
+   use SSSolverModule, only : getRegSolution, getRegSolutionDerivative, getSolutionRmeshSize
+   implicit none
+   integer(IntKind), intent(in) :: id, ia
+   complex(CmplxKind), pointer, intent(in) :: kau(:,:,:)
+   complex(CmplxKind), pointer :: phi(:,:,:), dphi(:,:,:)
+   type(c_ptr) :: phi_ptrs(2), dphi_ptrs(2), dgreen_ptr
+   integer(c_int) :: nr, kp, kk, kg, spins, derivatives, status
+   integer(c_int) :: conjugate_index(kmax_kkr(id)), phase(kmax_kkr(id))
+   integer(IntKind) :: js, k
+
+   done = .false.
+   if (IntKind /= c_int .or. CmplxKind /= c_double_complex) return
+   nr = getSolutionRmeshSize(id)
+   kp = kmax_phi(id); kk = kmax_kkr(id); kg = (mst(id)%lmax+1)**2
+   spins = n_spin_cant
+!  The CPU GEMMs use compact local dimensions for the shared Gaunt array.
+!  Use that layout only when local and allocated dimensions agree.
+   if (kp /= kmax_phi_max .or. kg /= kmax_green_max) return
+   if (.not.is_contiguous(kau) .or. .not.is_contiguous(gaunt)) return
+   if (any(shape(kau) /= [kk,kk,spins*spins])) return
+   if (.not.is_contiguous(mst(id)%green)) return
+   phi_ptrs = c_null_ptr; dphi_ptrs = c_null_ptr; dgreen_ptr = c_null_ptr
+   do js = 1, spins
+      phi => getRegSolution(js,site=id,atom=ia)
+      if (.not.is_contiguous(phi)) return
+      if (any(shape(phi) /= [nr,kp,kk])) return
+      phi_ptrs(js) = c_loc(phi(1,1,1))
+      if (rad_deriv) then
+         dphi => getRegSolutionDerivative(js,site=id,atom=ia)
+         if (.not.is_contiguous(dphi)) return
+         if (any(shape(dphi) /= [nr,kp,kk])) return
+         dphi_ptrs(js) = c_loc(dphi(1,1,1))
+      endif
+   enddo
+   derivatives = 0
+   if (rad_deriv) then
+      if (.not.is_contiguous(mst(id)%der_green)) return
+      derivatives = 1
+      dgreen_ptr = c_loc(mst(id)%der_green(1,1,1,ia))
+   endif
+   do k = 1, kk
+      conjugate_index(k) = k - 2*mofk(k) - 1 ! Zero-based for CUDA.
+      phase(k) = m1m(mofk(k))
+   enddo
+   status = mst_reconstruct_green_gpu(nr,int(mst(id)%iend,c_int),kp,kk,kg,spins,derivatives, &
+      phi_ptrs,dphi_ptrs,c_loc(kau(1,1,1)),c_loc(gaunt(1,1,1)),conjugate_index,phase, &
+      c_loc(mst(id)%green(1,1,1,ia)),dgreen_ptr)
+   done = status == 1
+   end function reconstructGreenGPU
+#endif
 !
 !  *******************************************************************
 !

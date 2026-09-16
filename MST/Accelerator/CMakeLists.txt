@@ -8,8 +8,10 @@ if (USE_ACCELERATOR_CUDA_C)
               acclib.cu
               acclib.hpp
               accmath.hpp  
+              CusolverEmulation.hpp
               util_mat.cu
               LSMS_Accel.cu
+              GreenFunctionGPU.hpp
               cusolver_KKR_c.cu  
               invertMatrixKKR_CUDA.F90 
               )

@@ -4,6 +4,7 @@
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <complex.h>
+#include "CusolverEmulation.hpp"
 //#include "cudaDoubleComplex.hpp"
 //#include "DeviceStorage.hpp"
 
@@ -63,8 +64,9 @@ cudaEventCreate(&start);
 cudaEventCreate(&stop);
 cusolverDnHandle_t cusolverHandle;
 cusolverStatus_t cusolverStatus;
-cusolverDnCreate(&cusolverHandle);
-cusolverDnZgetrf_bufferSize(cusolverHandle, *m, *m, aDev, *m, &Lwork);
+checkCusolverErrors(cusolverDnCreate(&cusolverHandle));
+configureCusolverEmulation(cusolverHandle, cusolverEmulationMantissaBits());
+checkCusolverErrors(cusolverDnZgetrf_bufferSize(cusolverHandle, *m, *m, aDev, *m, &Lwork));
 //printf("Lwork is %d\n",Lwork);
 
 error=cudaMalloc((void**)&workArray, Lwork*sizeof(cuDoubleComplex));

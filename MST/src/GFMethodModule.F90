@@ -1,4 +1,5 @@
 module GFMethodModule
+   use NvtxModule, only : nvtxStartRange, nvtxEndRange
    use KindParamModule, only : IntKind, RealKind, CmplxKind
    use MathParamModule, only : ZERO, ONE, THREE, TEN, SQRT_PI, PI, PI2, PI4, &
                                CZERO, CONE, TWO, HALF, SQRTm1, Y0, FIVE, THIRD
@@ -980,6 +981,7 @@ contains
 !  ===================================================================
 !  initialize Single Site Scatterer
 !  -------------------------------------------------------------------
+   call nvtxStartRange('Scattering solver initialization')
    if (RelativisticFlag == 2) then
 !     ----------------------------------------------------------------
       isBxyz=is_Bxyz !xianglin
@@ -1005,6 +1007,7 @@ contains
                         stop_routine, print_level, derivative=rad_derivative)
 !  -------------------------------------------------------------------
    endif
+   call nvtxEndRange()
 !
 !  if (n_spin_cant == 2) then
 !     ----------------------------------------------------------------
@@ -1104,17 +1107,20 @@ contains
 !  ===================================================================
 !  calulate the integrated DOS and the Fermi energy
 !  -------------------------------------------------------------------
+   call nvtxStartRange('Energy integration and Fermi energy')
    if (RelativisticFlag == 2) then !xianglin
       call calRelIntegratedDOS(efermi)
    else
      call calIntegratedDOS(efermi)
    endif
+   call nvtxEndRange()
 !
 !  ===================================================================
 !  Average the density/DOS across all the processes for each atom so to
 !  make sure that the calculated density for each atom is the exactly
 !  same on all the processes it is mapped onto.
 !  -------------------------------------------------------------------
+   call nvtxStartRange('Valence density update')
    call averageElectroStruct(IntegrValue)
 !  -------------------------------------------------------------------
 !
@@ -1127,6 +1133,7 @@ contains
 !  call calDensity to compute the electron and moment densities
 !  -------------------------------------------------------------------
    call calDensity(efermi)
+   call nvtxEndRange()
 !  -------------------------------------------------------------------
 !
 !  ===================================================================
@@ -1185,6 +1192,7 @@ contains
 !     call endMagneticForce()
 !  endif
 !
+   call nvtxStartRange('Scattering solver cleanup')
    if (RelativisticFlag == 2) then
       call endRelMSSolver() 
       call endRelSSSolver()
@@ -1192,6 +1200,7 @@ contains
       call endMSSolver()
       call endSSSolver()
    endif
+   call nvtxEndRange()
 !
    if (allocated(MatrixPoles)) then
       if (ErBottom < ZERO .and. isPole) then !xianglin
@@ -2106,6 +2115,7 @@ contains
 !  ===================================================================
 !  Iterate the ending point of the energy contour to find the Fermi energy
 !  ===================================================================
+   call nvtxStartRange('Fermi-energy search')
    BadFermiEnergy = 1
    LOOP_LastE: do while (BadFermiEnergy > 0 .and. BadFermiEnergy <= MaxIterations)
 !     ===============================================================
@@ -2157,8 +2167,10 @@ contains
 !           ----------------------------------------------------------
             call setMScatteringDOSParam(id,LastValue(id)%NumRs,LastValue(id)%jmax)
 !           ----------------------------------------------------------
+            call nvtxStartRange('DOS and density integration')
             msDOS = getMScatteringDOS(info,eLast,wk_dos)
             call calElectroStruct(info,n_spin_cant,wk_dos,LastValue(id))
+            call nvtxEndRange()
 !           ----------------------------------------------------------
             if ( node_print_level >= 0) then
                do ia = 1, LastValue(id)%NumSpecies
@@ -2303,6 +2315,7 @@ contains
 !        -------------------------------------------------------------
       endif
    enddo Loop_LastE
+   call nvtxEndRange()
 !
 !  -------------------------------------------------------------------
 !  call updateValenceDOS(efermi,Lloyd_factor)
@@ -4374,6 +4387,7 @@ contains
          do e_loc = 1,NumEsOnMyProc
             ie = getEnergyIndex(e_loc)
             time_ie = getTime()
+            call nvtxStartRange('Energy point')
 !
 !           =============================================================
 !           If LDA+DMFT is enabled, calculate the local Green function
@@ -4447,6 +4461,7 @@ contains
 !              call computeMagneticForce(adjustEnergy(1,EPoint(ie)))
 !              ----------------------------------------------------------
 !           endif
+            call nvtxStartRange('DOS and density integration')
             do id = 1, LocalNumAtoms
                pCurrentValue => LastValue(id) ! Use LastValue space for temporary working space.
 !              ----------------------------------------------------------
@@ -4508,6 +4523,7 @@ contains
 !!                     ', e = ',real(EPoint(ie),kind=RealKind),' 0.00000000D+00, SS DOS + MS DOS = ',ssDOS + msDOS(js)
 !!             enddo
             enddo !id loop
+            call nvtxEndRange()
 !
             time_ie = getTime()-time_ie
             if (node_print_level >= 0) then
@@ -4517,6 +4533,7 @@ contains
             call FlushFile(6)
 !           ----------------------------------------------------------
             call checkinTiming(tag='Calculate MS DOS',t=time_ie)
+            call nvtxEndRange()
 !           ----------------------------------------------------------
          enddo   ! Loop over energy parameter
 !        -------------------------------------------------------------

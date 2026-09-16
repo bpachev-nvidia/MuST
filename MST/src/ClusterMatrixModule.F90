@@ -5,6 +5,7 @@
 !  *                                                                 *
 !  *******************************************************************
 module ClusterMatrixModule
+   use NvtxModule, only : nvtxStartRange, nvtxEndRange
 !
    use KindParamModule, only : IntKind, RealKind, CmplxKind
    use PublicTypeDefinitionsModule, only : NeighborStruct
@@ -1350,7 +1351,9 @@ contains
    endif
 !
 !  -------------------------------------------------------------------
+   call nvtxStartRange('Scattering-matrix rotation and exchange')
    call exchangeSSSMatrix(getSingleScatteringMatrix)
+   call nvtxEndRange()
 !  -------------------------------------------------------------------
 !
    kappa = sqrt(energy)
@@ -1373,6 +1376,7 @@ contains
 !
 #ifdef ACCEL
       if (ComputeBigMatrixOnGPU) then
+         call nvtxStartRange('LIZ preparation and uploads')
 !        t0 = getTime()
 !        -------------------------------------------------------------
          call init_bigmatrix_gpu(dsize)
@@ -1418,6 +1422,7 @@ contains
          t0 = getTime()
          call commit_to_gpu(1)
          call commit_to_gpu(2)
+         call nvtxEndRange()
 !        if (node_print_level >= 0) then
 !           write(6,'(a,1i5,f8.3)')'Timing for copying sj matrix to GPU:',my_atom,getTime()-t0
 !        endif
@@ -2017,6 +2022,7 @@ contains
 !        Rotate the wau_g-matrix from global frame to local frame of references
 !        Note: if n_spin_cant = 1, wau_g and wau_l share the same space.
 !        =============================================================
+         call nvtxStartRange('LIZ result transformation')
          if ( n_spin_cant==2 ) then
             wau_l => aliasArray3_c(wsTau00L, kmax_kkr(my_atom), kmax_kkr(my_atom), 4)
 !           ----------------------------------------------------------
@@ -2082,6 +2088,7 @@ contains
 !              =======================================================
             enddo
          enddo
+         call nvtxEndRange()
       endif
    enddo
 !  ===================================================================

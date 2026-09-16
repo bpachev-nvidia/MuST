@@ -66,5 +66,8 @@ invertMatrixKKR_CUDA.o
 $(ACCLIB): $(OBJ0)
 	$(ARCHV) $@ $(OBJ0)
 
+LSMS_Accel.o: GreenFunctionGPU.hpp
+LSMS_Accel.o cusolver_KKR_c.o: CusolverEmulation.hpp
+
 clean:
 	cd $(ODIR); rm -f $(OBJ0) $(ACCLIB)

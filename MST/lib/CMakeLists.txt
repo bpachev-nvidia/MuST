@@ -10,6 +10,7 @@ target_sources(mst_lib
               SphericalHarmonicsModule.F90
               GauntFactorsModule.F90
               TimerModule.F90
+              NvtxModule.F90
               DerivativeModule.F90
               IntegrationModule.F90
               MatrixDeterminantModule.F90

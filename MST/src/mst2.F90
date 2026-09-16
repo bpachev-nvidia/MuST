@@ -1,5 +1,6 @@
 program mst2
    use ISO_FORTRAN_ENV, only : compiler_version, compiler_options
+   use NvtxModule, only : nvtxStartRange, nvtxEndRange
 !
    use KindParamModule, only : IntKind, RealKind, CmplxKind
 !
@@ -411,6 +412,7 @@ program mst2
    end interface
 !
 !  -------------------------------------------------------------------
+   call nvtxStartRange('Startup')
    call initTimer()
 !  -------------------------------------------------------------------
    t0 = getTime()
@@ -1614,6 +1616,7 @@ program mst2
 !     ----------------------------------------------------------------
    endif
 !
+   call nvtxEndRange()
    niter = 0
    SD_LOOP: do itstep = 1,ntstep
 !     ================================================================
@@ -1694,7 +1697,9 @@ program mst2
 !        =============================================================
          if (.not.isTestPotential() .and. .not.isFrozenCore(iter=iscf)) then
 !           ----------------------------------------------------------
+            call nvtxStartRange('Core states')
             call calCoreStates(evb)
+            call nvtxEndRange()
 !           ----------------------------------------------------------
             if (evb < ErBottom - TEN2m6) then
                ErBottom = evb
@@ -1727,7 +1732,9 @@ program mst2
 !        =============================================================
          if ( n_spin_cant == 2 ) then
 !           ----------------------------------------------------------
+            call nvtxStartRange('Spin constraint preparation')
             call calConstrainLM(itstep,iscf)
+            call nvtxEndRange()
 !           ----------------------------------------------------------
          endif
 !
@@ -1739,7 +1746,9 @@ program mst2
 !        =============================================================
          t3 = getTime()
 !        -------------------------------------------------------------
+         call nvtxStartRange('Valence states')
          call calValenceStates()
+         call nvtxEndRange()
 !        -------------------------------------------------------------
          if (node_print_level >= 0) then
             write(6,'(''Time:: calValenceStates :'',f12.5,''Sec'')')getTime()-t3
@@ -1754,7 +1763,9 @@ program mst2
 !        =============================================================
          if ( n_spin_cant == 2 ) then
 !           ----------------------------------------------------------
+            call nvtxStartRange('Spin constraint update')
             call updateConstrainLM()
+            call nvtxEndRange()
 !           ----------------------------------------------------------
          endif
 !        =============================================================
@@ -1764,6 +1775,7 @@ program mst2
 !        =============================================================
 !        Construct the total electron density (and moment density)
 !        -------------------------------------------------------------
+         call nvtxStartRange('Charge density and distribution')
          call constructChargeDensity()
 !        -------------------------------------------------------------
 !
@@ -1775,6 +1787,7 @@ program mst2
 !        update the charge distribution table.
 !        -------------------------------------------------------------
          call updateChargeDistribution(getExchangeEnergy)
+         call nvtxEndRange()
 !        -------------------------------------------------------------
 !        =============================================================
 !
@@ -1786,9 +1799,11 @@ program mst2
 #ifdef EPrint_MT
          if ( isFullPotential() ) then
 !           ----------------------------------------------------------
+            call nvtxStartRange('Muffin-tin potential and energy')
             call computeNewPotential(isMT=.true.)
 !           ----------------------------------------------------------
             call computeEnergyFunctional(isMT=.true.)
+            call nvtxEndRange()
 !           ----------------------------------------------------------
             if ( node_print_level >= 0 ) then
 !              -------------------------------------------------------
@@ -1799,7 +1814,9 @@ program mst2
 #endif
          t2 = getTime()
 !        -------------------------------------------------------------
+         call nvtxStartRange('Potential generation')
          call computeNewPotential()
+         call nvtxEndRange()
 !        -------------------------------------------------------------
          if (node_print_level >= 0) then
             write(6,'(/,a,f10.5,/)')'Time:: computeNewPotential: ',getTime()-t2
@@ -1812,7 +1829,9 @@ program mst2
 !        =============================================================
 !        calculate the DFT total energy.
 !        -------------------------------------------------------------
+         call nvtxStartRange('Total energy')
          call computeEnergyFunctional()
+         call nvtxEndRange()
 !        -------------------------------------------------------------
          if ( node_print_level >= 0 ) then
 !           ----------------------------------------------------------
@@ -1825,7 +1844,9 @@ program mst2
 !        =============================================================
          if ( isFullPotential() ) then
 !           ----------------------------------------------------------
+            call nvtxStartRange('Forces')
             call calForce()
+            call nvtxEndRange()
 !           ----------------------------------------------------------
             if (node_print_level >= 0) then
 !              -------------------------------------------------------
@@ -1836,9 +1857,11 @@ program mst2
 !        =============================================================
 !        check for convergence
 !        -------------------------------------------------------------
+         call nvtxStartRange('Convergence check')
          call checkConvergence( rho_rms, pot_rms,                     &
                                 evec_rms, bcon_rms, getFermiEnergy(), &
                                 getEnergyPerAtom(), itstep, iscf, max_rms, ScfConverged)
+         call nvtxEndRange()
 !        -------------------------------------------------------------
 !
 !        =============================================================
@@ -1864,6 +1887,7 @@ program mst2
 !        =============================================================
 !        setup the quantities for mixing.
 !        =============================================================
+         call nvtxStartRange('SCF mixing')
          if ( .not. isFullPotential() ) then
 !           ----------------------------------------------------------
             call setupMixRealArrayList( LocalNumAtoms, n_spin_pola,    &
@@ -1886,6 +1910,7 @@ program mst2
             call updateMixCmplxValues(LocalNumAtoms,n_spin_pola,ArrayList)
 !           ----------------------------------------------------------
          endif
+         call nvtxEndRange()
 !
          if ( movie > 0 .and. MyPE == 0) then
             if (iscf == 1 .and. itstep == 1) then
@@ -1911,6 +1936,7 @@ program mst2
 !        *************************************************************
 !
 !        =============================================================
+         call nvtxStartRange('Potential and density update')
          if ( isChargeMixing() ) then
 !           ==========================================================
 !           update the potential
@@ -1939,6 +1965,7 @@ program mst2
 !
          Efermi = getFermiEnergy()
          call setPotEf(Efermi)
+         call nvtxEndRange()
 !        =============================================================
 !
 !        *************************************************************
@@ -1972,9 +1999,11 @@ program mst2
 !
          t3 = getTime()
 !        -------------------------------------------------------------
+         call nvtxStartRange('SCF output')
          call  printScfResults(GlobalNumAtoms,LocalNumAtoms,             &
                                node_print_level,atom_print_level,n_write,&
                                movie,iscf,nscf,ScfConverged)
+         call nvtxEndRange()
 !        -------------------------------------------------------------
          t_outp = t_outp + (getTime() - t3)
 !
@@ -1988,7 +2017,9 @@ program mst2
                                   .or. ScfConverged) ) then
             t3 = getTime()
 !           ----------------------------------------------------------
+            call nvtxStartRange('Potential output')
             call writePotential()
+            call nvtxEndRange()
 !           ----------------------------------------------------------
             t_outp = t_outp + (getTime() - t3)
             n_potwrite = 0
@@ -2024,6 +2055,7 @@ program mst2
       endif
    enddo SD_LOOP
 !
+   call nvtxStartRange('Final output and cleanup')
    if ( MyPE==0 .and. movie > 0) then
       call driverSystemMovie( .false., getEnergyPerAtom(), funit_sysmov, en_movie )
    endif
@@ -2218,5 +2250,6 @@ stop 'Under construction...'
 !
    call endTimer()
    call endOutput()
+   call nvtxEndRange()
 !
 end program mst2

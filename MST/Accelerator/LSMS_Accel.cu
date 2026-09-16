@@ -3,6 +3,12 @@
 #include <math.h>
 #include <time.h>
 #include <cmath>
+#include <string>
+#include <vector>
+#include <limits>
+#include <initializer_list>
+#include <cstring>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cusolverDn.h>
@@ -11,6 +17,45 @@
 #include "cuComplex.h"
 #include "acclib.hpp"
 #include "accmath.hpp"
+#include "CusolverEmulation.hpp"
+#include "GreenFunctionGPU.hpp"
+
+namespace {
+// Keep logical nesting, but emit only one active MST range per host thread.
+// Names must be owned: Fortran passes temporary, null-terminated strings.
+thread_local std::vector<std::string> nvtxRangeStack;
+} // namespace
+
+// C bindings avoid compiler-specific Fortran character-length arguments.
+// Starting a child ends the parent's current segment, so reported times are
+// exclusive. Parent ranges resume on pop; their instance counts are segments,
+// not whole invocations. These helpers do not synchronize GPU execution.
+extern "C" void mst_nvtx_range_push(const char *name) {
+   if (!nvtxRangeStack.empty()) {
+      nvtxRangePop();
+   }
+   nvtxRangeStack.emplace_back(name);
+   nvtxRangePushA(nvtxRangeStack.back().c_str());
+}
+
+extern "C" void mst_nvtx_range_pop() {
+   if (nvtxRangeStack.empty()) return;
+   nvtxRangePop();
+   nvtxRangeStack.pop_back();
+   if (!nvtxRangeStack.empty()) {
+      nvtxRangePushA(nvtxRangeStack.back().c_str());
+   }
+}
+
+namespace {
+class ScopedNvtxRange {
+public:
+   explicit ScopedNvtxRange(const char *name) { mst_nvtx_range_push(name); }
+   ~ScopedNvtxRange() { mst_nvtx_range_pop(); }
+   ScopedNvtxRange(const ScopedNvtxRange &) = delete;
+   ScopedNvtxRange &operator=(const ScopedNvtxRange &) = delete;
+};
+} // namespace
 
 __constant__ int lmax_kkr_max = 8;
 __constant__ int lmax_max = 16; // = 2*lmax_kkr_max
@@ -386,6 +431,265 @@ cudaStream_t stream;
 cusolverDnHandle_t cusolverHandle;
 static cublasHandle_t cublasHandle = nullptr;
 
+namespace {
+int luMantissaBits = -2; // No configuration applied yet.
+size_t luWorkspaceCapacity = 0;
+
+void prepareLUWorkspace() {
+   const int bits = cusolverEmulationMantissaBits();
+   if (bits == luMantissaBits) return;
+
+   configureCusolverEmulation(cusolverHandle, bits);
+   int lwork = 0;
+   checkCusolverErrors(cusolverDnZgetrf_bufferSize(cusolverHandle, mmat_size, mmat_size,
+                                                  BigMat_d, mmat_size, &lwork));
+   const size_t bytes = static_cast<size_t>(lwork) * sizeof(cuDoubleComplex);
+   if (bytes > luWorkspaceCapacity) {
+      if (workArray) checkCudaErrors(cudaFreeAsync(workArray, stream));
+      checkCudaErrors(cudaMallocAsync((void **)&workArray, bytes, stream));
+      luWorkspaceCapacity = bytes;
+   }
+   luMantissaBits = bits;
+}
+
+template <typename T> struct GreenDeviceBuffer {
+   T *data = nullptr;
+   size_t capacity = 0;
+
+   bool reserve(size_t count) {
+      if (count <= capacity) return true;
+      release();
+      if (count > std::numeric_limits<size_t>::max() / sizeof(T)) return false;
+      const cudaError_t status = cudaMalloc(reinterpret_cast<void **>(&data), count * sizeof(T));
+      if (status == cudaErrorMemoryAllocation) {
+         data = nullptr;
+         (void)cudaGetLastError();
+         return false;
+      }
+      checkCudaErrors(status);
+      capacity = count;
+      return true;
+   }
+
+   void release() {
+      if (data) checkCudaErrors(cudaFree(data));
+      data = nullptr;
+      capacity = 0;
+   }
+};
+
+// Reused across energies/species/atoms; never retain an entire set of LIZs.
+// Each successful reconstruction synchronizes before returning to Fortran.
+struct GreenGpuWorkspace {
+   bool allocation_failed = false;
+   GreenDeviceBuffer<cuDoubleComplex> phi, kau, gaunt, ppr, ppg, green;
+   GreenDeviceBuffer<const cuDoubleComplex *> a, b;
+   GreenDeviceBuffer<cuDoubleComplex *> c;
+   GreenDeviceBuffer<int> phase;
+
+   void release() {
+      phi.release(); kau.release(); gaunt.release(); ppr.release();
+      ppg.release(); green.release(); a.release(); b.release();
+      c.release(); phase.release();
+   }
+};
+GreenGpuWorkspace greenWorkspace;
+
+bool greenElementCount(std::initializer_list<size_t> dimensions, size_t &count) {
+   count = 1;
+   const size_t limit = std::numeric_limits<size_t>::max() / sizeof(cuDoubleComplex);
+   for (size_t dimension : dimensions) {
+      if (dimension == 0 || count > limit / dimension) return false;
+      count *= dimension;
+   }
+   return true;
+}
+
+// Each thread owns one (radial point, Green harmonic, spin pair), so no
+// atomics are needed. Match the CPU's kl2/klp2 summation order. Phi_right
+// is intentionally NOT conjugated: that convention is already encoded by
+// the kl2 -> kl2c permutation and the (-1)^m phase in MSSolverModule.
+__global__ void reduceGreenFunctionKernel(
+   int nr, int nout, int kp, int kk, int kg, int spins, bool derivatives,
+   const cuDoubleComplex *phi, const cuDoubleComplex *ppg, const int *phase,
+   cuDoubleComplex *green) {
+   const size_t pairs = spins * spins;
+   const size_t phi_size = static_cast<size_t>(nr) * kp * kk;
+   const size_t ppg_size = static_cast<size_t>(nr) * kg * kp;
+   const size_t result_size = static_cast<size_t>(nout) * kg * pairs;
+   for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+        index < result_size; index += static_cast<size_t>(blockDim.x) * gridDim.x) {
+      const int r = index % nout;
+      const int g = (index / nout) % kg;
+      const int pair = index / (static_cast<size_t>(nout) * kg);
+      const int right_spin = pair / spins;
+      cuDoubleComplex value = make_cuDoubleComplex(0.0, 0.0);
+      cuDoubleComplex derivative = make_cuDoubleComplex(0.0, 0.0);
+      for (int k = 0; k < kk; ++k) {
+         for (int p = 0; p < kp; ++p) {
+            const size_t angular = (static_cast<size_t>(pair) * kk + k) * ppg_size
+                                 + (static_cast<size_t>(p) * kg + g) * nr + r;
+            const size_t radial = right_spin * phi_size
+                                + (static_cast<size_t>(k) * kp + p) * nr + r;
+            cuDoubleComplex left = ppg[angular];
+            left.x *= phase[k]; left.y *= phase[k];
+            const cuDoubleComplex right = phi[radial];
+            value = cuCadd(value, cuCmul(left, right));
+            if (derivatives) {
+               cuDoubleComplex dleft = ppg[angular + pairs * kk * ppg_size];
+               dleft.x *= phase[k]; dleft.y *= phase[k];
+               const cuDoubleComplex dright = phi[radial + spins * phi_size];
+               derivative = cuCadd(derivative,
+                  cuCadd(cuCmul(dleft, right), cuCmul(left, dright)));
+            }
+         }
+      }
+      green[index] = value;
+      if (derivatives) green[index + result_size] = derivative;
+   }
+}
+} // namespace
+
+extern "C" int mst_reconstruct_green_gpu(
+   int nr, int nout, int kp, int kk, int kg, int spins, int derivatives,
+   const void *const *phi, const void *const *dphi, const void *kau,
+   const void *gaunt, const int *conjugate_index, const int *phase,
+   void *green, void *dgreen) {
+   const char *enabled = std::getenv("MST_GPU_GREEN");
+   if (!initialized || !cublasHandle || greenWorkspace.allocation_failed ||
+       (enabled && std::strcmp(enabled, "0") == 0)) return 0;
+   if (nr < 1 || nout < 1 || nout > nr || kp < 1 || kk < 1 || kg < 1 ||
+       (spins != 1 && spins != 2) || (derivatives != 0 && derivatives != 1) ||
+       !phi || !kau || !gaunt || !conjugate_index || !phase || !green ||
+       (derivatives && (!dphi || !dgreen))) return 0;
+   for (int s = 0; s < spins; ++s) {
+      if (!phi[s] || (derivatives && !dphi[s])) return 0;
+   }
+   for (int k = 0; k < kk; ++k) {
+      if (conjugate_index[k] < 0 || conjugate_index[k] >= kk ||
+          (phase[k] != 1 && phase[k] != -1)) return 0;
+   }
+   const int pairs = spins * spins;
+   const int jobs = pairs * (1 + derivatives);
+   const int int_max = std::numeric_limits<int>::max();
+   if (nr > int_max / kp || kg > int_max / kp || kk > int_max / jobs) return 0;
+   const int angular_jobs = jobs * kk;
+   size_t phi_size, phi_count, kau_count, gaunt_count, ppr_count, ppg_count, result_size, result_count;
+   if (!greenElementCount({size_t(nr), size_t(kp), size_t(kk)}, phi_size) ||
+       !greenElementCount({phi_size, size_t(spins), size_t(1 + derivatives)}, phi_count) ||
+       !greenElementCount({size_t(kk), size_t(kk), size_t(pairs)}, kau_count) ||
+       !greenElementCount({size_t(kp), size_t(kg), size_t(kp)}, gaunt_count) ||
+       !greenElementCount({phi_size, size_t(jobs)}, ppr_count) ||
+       !greenElementCount({size_t(nr), size_t(kg), size_t(kp), size_t(angular_jobs)}, ppg_count) ||
+       !greenElementCount({size_t(nout), size_t(kg), size_t(pairs)}, result_size) ||
+       !greenElementCount({result_size, size_t(1 + derivatives)}, result_count)) return 0;
+
+   ScopedNvtxRange reconstruction_range("GPU Green-function reconstruction");
+   auto &w = greenWorkspace;
+   {
+      ScopedNvtxRange range("GPU Green-function workspace");
+      if (!w.phi.reserve(phi_count) || !w.kau.reserve(kau_count) ||
+          !w.gaunt.reserve(gaunt_count) || !w.ppr.reserve(ppr_count) ||
+          !w.ppg.reserve(ppg_count) || !w.green.reserve(result_count) ||
+          !w.a.reserve(angular_jobs) || !w.b.reserve(angular_jobs) ||
+          !w.c.reserve(angular_jobs) || !w.phase.reserve(kk)) {
+         w.release();
+         // Avoid retrying large allocations at every energy in this SCF step.
+         w.allocation_failed = true;
+         static bool warned = false;
+         if (!warned) {
+            fprintf(stderr, "GPU Green-function workspace allocation failed; using CPU reconstruction.\n");
+            warned = true;
+         }
+         return 0;
+      }
+   }
+   {
+      ScopedNvtxRange range("GPU Green-function upload");
+      for (int s = 0; s < spins; ++s) {
+         checkCudaErrors(cudaMemcpyAsync(w.phi.data + s * phi_size, phi[s],
+            phi_size * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice, stream));
+         if (derivatives) {
+            checkCudaErrors(cudaMemcpyAsync(w.phi.data + (s + spins) * phi_size, dphi[s],
+               phi_size * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice, stream));
+         }
+      }
+      checkCudaErrors(cudaMemcpyAsync(w.kau.data, kau, kau_count * sizeof(cuDoubleComplex),
+                                     cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.gaunt.data, gaunt, gaunt_count * sizeof(cuDoubleComplex),
+                                     cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.phase.data, phase, kk * sizeof(int),
+                                     cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaStreamSynchronize(stream));
+   }
+
+   std::vector<const cuDoubleComplex *> a(angular_jobs), b(angular_jobs);
+   std::vector<cuDoubleComplex *> c(angular_jobs);
+   const cuDoubleComplex one = make_cuDoubleComplex(1.0, 0.0);
+   const cuDoubleComplex zero = make_cuDoubleComplex(0.0, 0.0);
+   {
+      ScopedNvtxRange range("GPU Green-function wavefunction GEMMs");
+      for (int job = 0; job < jobs; ++job) {
+         const int pair = job % pairs;
+         const int left_spin = pair % spins;
+         const int derivative = job / pairs;
+         a[job] = w.phi.data + (left_spin + derivative * spins) * phi_size;
+         b[job] = w.kau.data + static_cast<size_t>(pair) * kk * kk;
+         c[job] = w.ppr.data + job * phi_size;
+      }
+      checkCudaErrors(cudaMemcpyAsync(w.a.data, a.data(), jobs * sizeof(a[0]), cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.b.data, b.data(), jobs * sizeof(b[0]), cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.c.data, c.data(), jobs * sizeof(c[0]), cudaMemcpyHostToDevice, stream));
+      checkCublasErrors(cublasZgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+         nr * kp, kk, kk, &one, w.a.data, nr * kp, w.b.data, kk,
+         &zero, w.c.data, nr * kp, jobs));
+      checkCudaErrors(cudaStreamSynchronize(stream));
+   }
+   {
+      ScopedNvtxRange range("GPU Green-function angular GEMMs");
+      const size_t angular_size = static_cast<size_t>(nr) * kg * kp;
+      for (int job = 0; job < jobs; ++job) {
+         for (int k = 0; k < kk; ++k) {
+            const int batch = job * kk + k;
+            a[batch] = w.ppr.data + job * phi_size
+                     + static_cast<size_t>(conjugate_index[k]) * nr * kp;
+            b[batch] = w.gaunt.data;
+            c[batch] = w.ppg.data + batch * angular_size;
+         }
+      }
+      checkCudaErrors(cudaMemcpyAsync(w.a.data, a.data(), angular_jobs * sizeof(a[0]), cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.b.data, b.data(), angular_jobs * sizeof(b[0]), cudaMemcpyHostToDevice, stream));
+      checkCudaErrors(cudaMemcpyAsync(w.c.data, c.data(), angular_jobs * sizeof(c[0]), cudaMemcpyHostToDevice, stream));
+      // All jobs share Gaunt, but have disjoint outputs. Apply the per-k phase
+      // in the reduction, allowing one common alpha for the entire batch.
+      checkCublasErrors(cublasZgemmBatched(cublasHandle, CUBLAS_OP_N, CUBLAS_OP_N,
+         nr, kg * kp, kp, &one, w.a.data, nr, w.b.data, kp,
+         &zero, w.c.data, nr, angular_jobs));
+      checkCudaErrors(cudaStreamSynchronize(stream));
+   }
+   {
+      ScopedNvtxRange range("GPU Green-function reduction");
+      const int threads = 128;
+      const int blocks = static_cast<int>(min((result_size + threads - 1) / threads, size_t(65535)));
+      reduceGreenFunctionKernel<<<blocks, threads, 0, stream>>>(
+         nr, nout, kp, kk, kg, spins, derivatives != 0,
+         w.phi.data, w.ppg.data, w.phase.data, w.green.data);
+      checkCudaErrors(cudaPeekAtLastError());
+      checkCudaErrors(cudaStreamSynchronize(stream));
+   }
+   {
+      ScopedNvtxRange range("GPU Green-function download");
+      checkCudaErrors(cudaMemcpyAsync(green, w.green.data, result_size * sizeof(cuDoubleComplex),
+                                     cudaMemcpyDeviceToHost, stream));
+      if (derivatives) {
+         checkCudaErrors(cudaMemcpyAsync(dgreen, w.green.data + result_size,
+            result_size * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost, stream));
+      }
+      checkCudaErrors(cudaStreamSynchronize(stream));
+   }
+   return 1;
+}
+
 void runYlmOverLIZ(int na, int liz_max, int l_max) {
 
       // Define kernel launch parameters
@@ -414,7 +718,7 @@ void calculate_gij_gpu_(double _Complex *kappa, int *numnb_max,
       fprintf(stderr, "\nError in calculate_gij_gpu: Needs to call allocate_gijmatrix_gpu first.\n");
       exit(EXIT_FAILURE);
    }
-   nvtxRangePushA("Gij construction");
+   mst_nvtx_range_push("Gij construction");
    
    // double _Complex e2 = kappa*kappa;
    // std::complex<double> e2 = kappa*kappa;
@@ -438,7 +742,7 @@ void calculate_gij_gpu_(double _Complex *kappa, int *numnb_max,
                                                    posi_d,lofk_d,nj3_d,kj3_d,cgnt_d,Ylm_d,gij_d);
 
    checkCudaErrors(cudaDeviceSynchronize());
-   nvtxRangePop();
+   mst_nvtx_range_pop();
 }
 
 extern "C"
@@ -468,6 +772,7 @@ void get_gij_from_gpu_(int *ip, int *jp, int *lmax, double _Complex *gij) {
 extern "C"
 void init_lsms_gpu_(int *cant, int *dsize, int *block_size, int *ntasks, int *cmode, int *my_pe) {
    if (!initialized) {
+      ScopedNvtxRange range("GPU initialization");
       n_spin_cant = *cant;
       mmat_size = *dsize;
       tau_size = *block_size;
@@ -521,6 +826,7 @@ void init_lsms_gpu_(int *cant, int *dsize, int *block_size, int *ntasks, int *cm
 
 extern "C"
 void allocate_bigmatrix_gpu_() {
+   ScopedNvtxRange range("GPU matrix allocation");
    if (!initialized) {
       printf("\nIt needs to call init_lsms_gpu first.\n");
       exit(EXIT_FAILURE);
@@ -544,16 +850,14 @@ void allocate_bigmatrix_gpu_() {
 
    checkCudaErrors(cudaMallocAsync((void**)&block_d, size_block, stream));
 
-   int Lwork = 0;
-   checkCusolverErrors(cusolverDnZgetrf_bufferSize(cusolverHandle, mmat_size, mmat_size, nullptr, 
-                                                   mmat_size, &Lwork));
-   checkCudaErrors(cudaMallocAsync((void**)&workArray, Lwork*sizeof(cuDoubleComplex), stream));
+   prepareLUWorkspace();
       
    BigMat_allocated = true;
 }
 
 extern "C"
 void allocate_sjgmatrix_gpu_() {
+   ScopedNvtxRange range("GPU assembly buffer allocation");
    if (initialized) {
       // Note: both mmat_size and tau_size contain a factor of n_spin_cant
       const size_t size_sj = static_cast<size_t>(mmat_size) * tau_size * sizeof(cuDoubleComplex);
@@ -605,6 +909,7 @@ extern "C"
 void compute_ylm_gpu_(int *lmax, int *local_atoms, int *numnb_max, 
                      int *num_nbs, double *posi, int *my_pe) {
    if (!Ylm_allocated) {
+      ScopedNvtxRange range("GPU spherical harmonics precomputation");
       int lmax_kkr = *lmax;
       int lmax2 = 2*lmax_kkr;
       int liz_max = *numnb_max+1;
@@ -637,6 +942,7 @@ extern "C"
 void push_parameters_gpu_(int *lmax, int *lofk, int *kj3_size_1, int *kj3_size_2,
                           int *nj3, int *kj3, double *cgnt, double *Clm) {
    if (!param_pushed) {
+      ScopedNvtxRange range("GPU parameter upload");
       int jmax = (*lmax+1)*(*lmax+2)/2;
       int kmax = (*lmax+1)*(*lmax+1);
       size_t size_lofk_d = kmax * sizeof(int);
@@ -674,6 +980,9 @@ void push_parameters_gpu_(int *lmax, int *lofk, int *kj3_size_1, int *kj3_size_2
 extern "C"
 void finalize_lsms_gpu_() {
    if (!initialized) return; // FIXED: Prevent destroying uninitialized handles
+   ScopedNvtxRange range("GPU cleanup");
+   greenWorkspace.release();
+   greenWorkspace.allocation_failed = false;
 
    if (SJG_allocated) {
       checkCudaErrors(cudaFreeAsync(sine_d, stream));
@@ -697,6 +1006,9 @@ void finalize_lsms_gpu_() {
       checkCudaErrors(cudaFreeAsync(block_d, stream));
       checkCudaErrors(cudaFreeAsync(workArray, stream));
    }
+   workArray = nullptr;
+   luWorkspaceCapacity = 0;
+   luMantissaBits = -2;
    // Ensure all frees complete before destroying stream
    checkCublasErrors(cublasDestroy(cublasHandle));
    cublasHandle = nullptr;
@@ -735,6 +1047,7 @@ void free_parameters_gpu_() {
 
 extern "C"
 void init_bigmatrix_gpu_(int *b_size) {
+   ScopedNvtxRange range("GPU matrix initialization");
    if (*b_size != mmat_size) {
       fprintf(stderr,"\nError: b_size <> mmat_size, %d,%d\n",*b_size,mmat_size);
       exit(EXIT_FAILURE);
@@ -822,6 +1135,7 @@ void push_gij_matrix_gpu_(int *row, int *col, double _Complex *gij, int *kkri) {
 
 extern "C"
 void push_bigmatrix_gpu_(double _Complex *bm, int *b_size) {
+   ScopedNvtxRange range("GPU full matrix upload");
    if (*b_size != mmat_size) {
       fprintf(stderr,"\nError: b_size <> mmat_size, %d,%d\n",*b_size,mmat_size);
       exit(EXIT_FAILURE);
@@ -832,6 +1146,9 @@ void push_bigmatrix_gpu_(double _Complex *bm, int *b_size) {
 
 extern "C"
 void commit_to_gpu_(int *mat_id) {
+   // These ranges measure submission; no synchronization is added.
+   ScopedNvtxRange range(*mat_id == 1 ? "GPU sine upload" :
+                         *mat_id == 2 ? "GPU inverse Jost upload" : "GPU Gij upload");
    size_t size = sizeof(cuDoubleComplex)*mmat_size*mmat_size;
    const size_t size_sj = sizeof(cuDoubleComplex)*mmat_size*tau_size;
    
@@ -871,7 +1188,7 @@ void commit_to_gpu_(int *mat_id) {
 extern "C"
 void construct_bigmatrix_gpu_(double _Complex *kappa, int *numnb_max, 
                               int *ia, int *num_nbs, int *lmax_kkr) {
-    nvtxRangePushA("Matrix construction");
+    mst_nvtx_range_push("Matrix construction");
 
     const cuDoubleComplex one = make_cuDoubleComplex(1.0, 0.0);
     const cuDoubleComplex zero = make_cuDoubleComplex(0.0, 0.0);
@@ -968,7 +1285,7 @@ void construct_bigmatrix_gpu_(double _Complex *kappa, int *numnb_max,
     }
     // Wait for assembly so the NVTX range includes GPU execution.
     checkCudaErrors(cudaStreamSynchronize(stream));
-    nvtxRangePop();
+    mst_nvtx_range_pop();
 }
 
 // Initialize the first nrhs columns of the identity in column-major storage.
@@ -988,13 +1305,16 @@ void invert_bigmatrix_gpu_(double _Complex *block, int *block_size) {
    }
 
    // Factor the full matrix; all rows contribute to the requested inverse block.
-   nvtxRangePushA("LU factorization");
+   mst_nvtx_range_push("LU factorization");
+   // EmulationModule can change the environment after initialization and
+   // between energies. Workspace requirements can change with these settings.
+   prepareLUWorkspace();
    checkCusolverErrors(cusolverDnZgetrf(cusolverHandle, mmat_size, mmat_size, BigMat_d, mmat_size, 
                                         workArray, pivotArray, infoArray));
    checkCudaErrors(cudaStreamSynchronize(stream));
-   nvtxRangePop();
+   mst_nvtx_range_pop();
 
-   nvtxRangePushA("Post-processing after LU factorization");
+   mst_nvtx_range_push("Post-processing after LU factorization");
    // Solve A * X = I(:, 0:tau_size-1), producing only the needed inverse columns.
    // The solve costs O(mmat_size^2 * tau_size), instead of O(mmat_size^3).
    const size_t rhs_elements = static_cast<size_t>(mmat_size) * tau_size;
@@ -1019,5 +1339,5 @@ void invert_bigmatrix_gpu_(double _Complex *block, int *block_size) {
                                    cudaMemcpyDeviceToHost,stream));
 
    checkCudaErrors(cudaStreamSynchronize(stream));
-   nvtxRangePop();
+   mst_nvtx_range_pop();
 }

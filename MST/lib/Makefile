@@ -17,6 +17,7 @@ LegendreModule.o \
 SphericalHarmonicsModule.o \
 GauntFactorsModule.o \
 TimerModule.o \
+NvtxModule.o \
 DerivativeModule.o \
 IntegrationModule.o \
 MatrixDeterminantModule.o \
